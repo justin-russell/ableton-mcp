@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 # AbletonMCP/init.py
+# The coding line above is required by Live 10, which runs Remote Scripts on
+# Python 2.7: without it any non-ASCII character in this file is a SyntaxError
+# and the script silently fails to load.
 from __future__ import absolute_import, print_function, unicode_literals
 
 from _Framework.ControlSurface import ControlSurface
@@ -34,10 +38,28 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
 
+# Per-command limits for how long a client waits on Live's main thread.
+DEFAULT_COMMAND_TIMEOUT = 10.0
+LONG_COMMAND_TIMEOUTS = {
+    "create_audio_clip": 60.0,
+    "load_browser_item": 30.0,
+    "load_instrument_or_effect": 30.0,
+    "get_browser_tree": 30.0,
+    "get_session_snapshot": 30.0,
+}
+
+# Budget for walking Live's browser when resolving a URI. The walk runs on
+# Live's main thread, so an unbounded walk (Samples / User Library / Places can
+# hold tens of thousands of items) freezes the UI. Fail fast instead.
+BROWSER_WALK_MAX_NODES = 20000
+BROWSER_WALK_MAX_SECONDS = 4.0
+
 SCRIPT_CAPABILITIES = [
+    "get_selected_notes",
+    "duplicate_clip_loop",
     "get_session_info",
     "get_track_info",
     "get_script_info",
@@ -83,6 +105,14 @@ class AbletonMCP(ControlSurface):
         # Cache the song reference for easier access
         self._song = self.song()
 
+        # Live's Python API (the LOM) is only safe to touch from Live's main
+        # thread. Socket client threads never call it directly: they queue a
+        # task here and update_display() - which Live calls on the main thread
+        # roughly every 100 ms - runs it. ControlSurface.schedule_message is
+        # not used for this because it is not safe to call from other threads.
+        self._main_thread = threading.current_thread()
+        self._main_queue = queue.Queue()
+
         # Passive human-UI event queue (drained by MCP → Supabase)
         self._passive_events = []
         self._passive_lock = threading.Lock()
@@ -90,22 +120,83 @@ class AbletonMCP(ControlSurface):
         self._passive_track_count = None
         self._passive_track_bindings = []  # (track, [(add_name, callback), ...]) for cleanup
         self._song_passive_callbacks = []
-        
+        # Passive LOM listeners are only needed for opt-in dataset capture.
+        # They are registered lazily on the first drain_passive_events (which
+        # the MCP server only sends while dataset consent is on), so a normal
+        # session never carries hundreds of listeners on every track and clip.
+        self._passive_enabled = False
+        self._passive_rebind_pending = False
+
         # Start the socket server
         self.start_server()
 
-        # Register LOM listeners for passive capture (after song is ready)
-        try:
-            self._setup_passive_listeners()
-        except Exception as e:
-            self.log_message("Passive listener setup failed: " + str(e))
-            self.log_message(traceback.format_exc())
-        
         self.log_message("AbletonMCP initialized")
         
         # Show a message in Ableton
         self.show_message("AbletonMCP: Listening for commands on port " + str(DEFAULT_PORT))
     
+    # ── Main-thread dispatch ───────────────────────────────────────────────────
+
+    def update_display(self):
+        """Called by Live on the main thread (~10x per second)."""
+        ControlSurface.update_display(self)
+        self._drain_main_queue()
+
+    def _drain_main_queue(self, budget_seconds=0.05):
+        """Run queued main-thread work, yielding back to Live after a short budget."""
+        if self._passive_rebind_pending:
+            # Deferred from a tracks notification: rebinding listeners inside
+            # Live's own notification callback can hang Live.
+            self._passive_rebind_pending = False
+            try:
+                self._rebind_track_listeners()
+            except Exception as e:
+                self.log_message("rebind track listeners failed: " + str(e))
+        deadline = time.time() + budget_seconds
+        while True:
+            try:
+                task = self._main_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                task()
+            except Exception as e:
+                self.log_message("Main-thread task failed: " + str(e))
+                self.log_message(traceback.format_exc())
+            if time.time() > deadline:
+                return
+
+    def _run_on_main_thread(self, fn, timeout=DEFAULT_COMMAND_TIMEOUT):
+        """Run ``fn`` on Live's main thread and return its result (or raise).
+
+        If the caller gives up waiting, the task is cancelled so it cannot
+        fire later and surprise the user (e.g. a track appearing seconds after
+        the client already reported a timeout).
+        """
+        if threading.current_thread() is self._main_thread:
+            return fn()
+        box = queue.Queue(maxsize=1)
+        state = {"cancelled": False}
+
+        def task():
+            if state["cancelled"]:
+                return
+            try:
+                box.put(("ok", fn()))
+            except Exception as e:
+                box.put(("error", e))
+
+        self._main_queue.put(task)
+        try:
+            status, value = box.get(timeout=timeout)
+        except queue.Empty:
+            state["cancelled"] = True
+            raise RuntimeError(
+                "Timed out after %.0fs waiting for Live's main thread" % timeout)
+        if status == "error":
+            raise value
+        return value
+
     def disconnect(self):
         """Called when Ableton closes or the control surface is removed"""
         self.log_message("AbletonMCP disconnecting...")
@@ -236,8 +327,15 @@ class AbletonMCP(ControlSurface):
 
                     self.log_message("Received command: " + str(command.get("type", "unknown")))
 
-                    # Process the command and get response
-                    response = self._process_command(command)
+                    # Every command - reads included - runs on Live's main
+                    # thread; this client thread only waits for the result.
+                    command_type = command.get("type", "")
+                    timeout = LONG_COMMAND_TIMEOUTS.get(command_type, DEFAULT_COMMAND_TIMEOUT)
+                    try:
+                        response = self._run_on_main_thread(
+                            lambda: self._process_command(command), timeout)
+                    except Exception as e:
+                        response = {"status": "error", "message": str(e)}
 
                     # Send the response with explicit encoding
                     client.sendall(json.dumps(response).encode('utf-8'))
@@ -408,19 +506,12 @@ class AbletonMCP(ControlSurface):
                         self.log_message(traceback.format_exc())
                         response_queue.put({"status": "error", "message": str(e)})
                 
-                # Schedule the task to run on the main thread
+                # _process_command already runs on Live's main thread (see
+                # _run_on_main_thread), so run the task inline. Re-scheduling
+                # it here would make the main thread wait on itself.
+                main_thread_task()
                 try:
-                    self.schedule_message(0, main_thread_task)
-                except AssertionError:
-                    # If we're already on the main thread, execute directly
-                    main_thread_task()
-                
-                # create_audio_clip decodes/imports the file on the main
-                # thread and needs more than the default headroom.
-                long_running_commands = {"create_audio_clip": 60.0}
-                queue_timeout = long_running_commands.get(command_type, 10.0)
-                try:
-                    task_response = response_queue.get(timeout=queue_timeout)
+                    task_response = response_queue.get_nowait()
                     if task_response.get("status") == "error":
                         response["status"] = "error"
                         response["message"] = task_response.get("message", "Unknown error")
@@ -456,6 +547,14 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 clip_index = params.get("clip_index", 0)
                 response["result"] = self._get_clip_notes(track_index, clip_index)
+            elif command_type == "get_selected_notes":
+                response["result"] = self._get_selected_notes()
+            elif command_type == "duplicate_clip_loop":
+                response["result"] = self._duplicate_clip_loop(
+                    params.get("track_index", 0),
+                    params.get("clip_index", 0),
+                    params.get("target_clip_index", None),
+                    params.get("times", 2))
             elif command_type == "get_device_parameters":
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
@@ -486,13 +585,9 @@ class AbletonMCP(ControlSurface):
                         self.log_message(traceback.format_exc())
                         response_queue.put({"status": "error", "message": str(e)})
 
+                main_thread_task()  # already on the main thread
                 try:
-                    self.schedule_message(0, main_thread_task)
-                except AssertionError:
-                    main_thread_task()
-
-                try:
-                    task_response = response_queue.get(timeout=10.0)
+                    task_response = response_queue.get_nowait()
                     if task_response.get("status") == "error":
                         response["status"] = "error"
                         response["message"] = task_response.get("message", "Unknown error")
@@ -1327,6 +1422,26 @@ class AbletonMCP(ControlSurface):
     
     # Substring markers that point a URI at a likely root. Unmatched URIs fall
     # back to the default search order.
+    # Live's own URIs start with a category prefix ("query:AudioFx#EQ%20Eight",
+    # "query:Synths#Simpler", "query:Drums#FileId_2739"). These are checked
+    # first; the older substring hints below stay as a fallback.
+    _URI_PREFIX_ROOTS = (
+        ('query:synths#',      'instruments'),
+        ('query:drums#',       'drums'),
+        ('query:audiofx#',     'audio_effects'),
+        ('query:midifx#',      'midi_effects'),
+        ('query:sounds#',      'sounds'),
+        ('query:plugins#',     'plugins'),
+        ('query:maxforlive#',  'max_for_live'),
+        ('query:samples#',     'samples'),
+        ('query:userlibrary#', 'user_library'),
+        ('query:packs#',       'packs'),
+    )
+
+    # Roots that can hold tens of thousands of items. They are only walked
+    # when the URI points at them; walking them speculatively froze Live.
+    _HEAVY_ROOTS = ('sounds', 'samples', 'user_library', 'packs', 'max_for_live')
+
     _URI_ROOT_HINTS = (
         ('plugins',       ('vst:', 'vst3:', 'au:', 'query:plugins', 'plugin#')),
         ('max_for_live',  ('max for live', 'maxforlive', 'm4l', 'query:max')),
@@ -1340,7 +1455,35 @@ class AbletonMCP(ControlSurface):
         ('midi_effects',  ('query:midi effects', 'midieffects', '/midi_effects/')),
     )
 
+    def _root_for_uri(self, uri):
+        """Return the browser root attribute a URI belongs to, or None."""
+        try:
+            lowered = uri.lower()
+        except AttributeError:
+            return None
+        for prefix, attr in self._URI_PREFIX_ROOTS:
+            if lowered.startswith(prefix):
+                return attr
+        for attr, markers in self._URI_ROOT_HINTS:
+            if any(m in lowered for m in markers):
+                return attr
+        return None
+
     def _order_roots_by_uri(self, roots, uri):
+        """Pick which roots to walk, and in what order, for ``uri``.
+
+        The URI's own root goes first. Heavy roots (Sounds, Samples, User
+        Library, Packs, Max for Live) are dropped unless the URI names them.
+        """
+        target = self._root_for_uri(uri)
+        head = [(a, r) for (a, r) in roots if a == target]
+        tail = [(a, r) for (a, r) in roots
+                if a != target and a not in self._HEAVY_ROOTS]
+        if head or target is None:
+            return head + tail
+        return self._legacy_order_roots_by_uri(roots, uri)
+
+    def _legacy_order_roots_by_uri(self, roots, uri):
         """Reorder ``roots`` so the URI's likely root is walked first."""
         if not isinstance(uri, (bytes, str)) or not uri:
             return roots
@@ -1364,14 +1507,25 @@ class AbletonMCP(ControlSurface):
                 self._uri_cache = cache = {}
             if uri in cache:
                 return cache[uri]
+            self._walk_nodes = 0
+            self._walk_deadline = time.time() + BROWSER_WALK_MAX_SECONDS
             result = self._walk_browser_for_uri(browser_or_item, uri, max_depth, 0)
             if result is not None:
                 cache[uri] = result
+            elif self._walk_nodes >= BROWSER_WALK_MAX_NODES or time.time() > self._walk_deadline:
+                raise RuntimeError(
+                    "Gave up looking for '%s' after %d browser items / %.0fs so Live "
+                    "would not freeze. Load it by hand, or pass a more specific URI."
+                    % (uri, self._walk_nodes, BROWSER_WALK_MAX_SECONDS))
             return result
         return self._walk_browser_for_uri(browser_or_item, uri, max_depth, current_depth)
 
     def _walk_browser_for_uri(self, browser_or_item, uri, max_depth, current_depth):
         """Recursive walk used by :py:meth:`_find_browser_item_by_uri`."""
+        self._walk_nodes = getattr(self, "_walk_nodes", 0) + 1
+        if (self._walk_nodes >= BROWSER_WALK_MAX_NODES
+                or time.time() > getattr(self, "_walk_deadline", float("inf"))):
+            return None
         try:
             # Check if this is the item we're looking for
             if hasattr(browser_or_item, 'uri') and browser_or_item.uri == uri:
@@ -1579,7 +1733,18 @@ class AbletonMCP(ControlSurface):
                 self._passive_events = self._passive_events[-self._passive_max:]
 
     def _drain_passive_events(self):
-        """Return and clear the passive event queue (called by MCP poller)."""
+        """Return and clear the passive event queue (called by MCP poller).
+
+        The MCP server only polls this while dataset consent is on, so the
+        first call is what switches passive capture on.
+        """
+        if not self._passive_enabled:
+            self._passive_enabled = True
+            try:
+                self._setup_passive_listeners()
+            except Exception as e:
+                self.log_message("Passive listener setup failed: " + str(e))
+                self.log_message(traceback.format_exc())
         with self._passive_lock:
             events = list(self._passive_events)
             self._passive_events = []
@@ -1645,10 +1810,9 @@ class AbletonMCP(ControlSurface):
                 detail["removed"] = count < previous
                 detail["added"] = count > previous
             self._enqueue_passive("tracks_changed", detail)
-            try:
-                self._rebind_track_listeners()
-            except Exception as e:
-                self.log_message("rebind track listeners failed: " + str(e))
+            # Don't touch listeners inside Live's notification - defer to the
+            # next update_display tick.
+            self._passive_rebind_pending = True
 
         self._safe_add_listener(song, "add_tempo_listener", on_tempo)
         self._safe_add_listener(song, "add_signature_numerator_listener", on_sig_num)
@@ -1754,10 +1918,11 @@ class AbletonMCP(ControlSurface):
                                 track_index=t_index,
                                 clip_index=c_index,
                             )
-                            try:
-                                self._bind_clip_listeners(t_index, c_index)
-                            except Exception:
-                                pass
+                            # Defer: adding listeners inside this notification
+                            # is unsafe. A full rebind also tracks the new clip's
+                            # listeners so they are removed later (binding them
+                            # here directly leaked them).
+                            self._passive_rebind_pending = True
                         return _cb
 
                     slot_cb = make_slot_cb(track_index, clip_index)
@@ -2197,6 +2362,106 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting clip notes: " + str(e))
             raise
+
+    def _duplicate_clip_loop(self, track_index, clip_index, target_clip_index=None, times=2):
+        """copy a MIDI clip into an empty slot, repeating its loop `times` times.
+
+        The source clip is left untouched. With no target given, the next empty
+        slot below the source on the same track is used.
+        """
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if clip_index < 0 or clip_index >= len(track.clip_slots):
+            raise IndexError("Clip index out of range")
+        src_slot = track.clip_slots[clip_index]
+        if not src_slot.has_clip:
+            raise Exception("No clip in source slot")
+        src = src_slot.clip
+        if not getattr(src, "is_midi_clip", False):
+            raise Exception("Source clip is not a MIDI clip")
+        times = int(times)
+        if times < 1 or times > 16:
+            raise ValueError("times must be between 1 and 16")
+
+        if target_clip_index is None:
+            for ci in range(clip_index + 1, len(track.clip_slots)):
+                if not track.clip_slots[ci].has_clip:
+                    target_clip_index = ci
+                    break
+            if target_clip_index is None:
+                raise Exception("No empty clip slot below the source clip")
+        if target_clip_index < 0 or target_clip_index >= len(track.clip_slots):
+            raise IndexError("Target clip index out of range")
+        if track.clip_slots[target_clip_index].has_clip:
+            raise Exception("Target clip slot is not empty")
+
+        loop_start = float(src.loop_start)
+        loop_len = float(src.loop_end) - loop_start
+        notes = []
+        for n in self._notes_from_clip(src):
+            st = float(n["start_time"]) - loop_start
+            if st < 0 or st >= loop_len:
+                continue  # only notes inside the loop are repeated
+            for k in range(times):
+                notes.append({"pitch": n["pitch"], "start_time": st + k * loop_len,
+                              "duration": n["duration"], "velocity": n["velocity"],
+                              "mute": n.get("mute", False)})
+
+        dst_slot = track.clip_slots[target_clip_index]
+        dst_slot.create_clip(loop_len * times)
+        dst = dst_slot.clip
+        dst.set_notes(tuple((int(n["pitch"]), float(n["start_time"]), float(n["duration"]),
+                             float(n["velocity"]), bool(n["mute"])) for n in notes))
+        dst.name = (src.name + " x" + str(times)) if src.name else ("Copy x" + str(times))
+        return {
+            "track_index": track_index,
+            "source_clip_index": clip_index,
+            "target_clip_index": target_clip_index,
+            "length": loop_len * times,
+            "note_count": len(notes),
+            "name": dst.name,
+        }
+
+    def _get_selected_notes(self):
+        """selected notes in the clip shown in Detail view."""
+        clip = getattr(self._song.view, "detail_clip", None)
+        if clip is None:
+            raise Exception("No clip is open in the Detail view")
+        if not getattr(clip, "is_midi_clip", False):
+            raise Exception("The clip in the Detail view is not a MIDI clip")
+
+        notes = []
+        getter = getattr(clip, "get_selected_notes_extended", None)
+        if getter is not None:  # Live 11+
+            for n in getter():
+                notes.append({"pitch": int(n.pitch), "start_time": float(n.start_time),
+                              "duration": float(n.duration), "velocity": float(n.velocity),
+                              "mute": bool(n.mute)})
+        else:  # Live 10: tuples of (pitch, time, duration, velocity, mute)
+            for n in clip.get_selected_notes():
+                notes.append({"pitch": int(n[0]), "start_time": float(n[1]),
+                              "duration": float(n[2]), "velocity": float(n[3]),
+                              "mute": bool(n[4]) if len(n) > 4 else False})
+        notes.sort(key=lambda x: (x["start_time"], x["pitch"]))
+
+        # Locate the clip in Session view, if it lives there.
+        track_index, clip_index = None, None
+        for ti, track in enumerate(self._song.tracks):
+            for ci, slot in enumerate(track.clip_slots):
+                if slot.has_clip and slot.clip == clip:
+                    track_index, clip_index = ti, ci
+                    break
+            if track_index is not None:
+                break
+
+        return {
+            "clip_name": clip.name,
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "selected_count": len(notes),
+            "notes": notes,
+        }
 
     def _get_device_parameters(self, track_index, device_index):
         try:

@@ -139,14 +139,22 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator", "duplicate_clip_loop"
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
         # than the default modifying-command budget (e.g. importing/decoding a
         # large audio file). Give them a wider socket timeout so we don't time
         # out before the Remote Script's own queue does.
-        long_running_commands = {"create_audio_clip": 65.0}
+        # Keep these a few seconds above the Remote Script's own limits
+        # (LONG_COMMAND_TIMEOUTS) so the script reports its error first.
+        long_running_commands = {
+            "create_audio_clip": 65.0,
+            "load_instrument_or_effect": 35.0,
+            "load_browser_item": 35.0,
+            "get_browser_tree": 35.0,
+            "get_session_snapshot": 35.0,
+        }
         
         try:
             logger.info(f"Sending command: {command_type} with params: {params}")
@@ -508,6 +516,72 @@ def get_clip_notes(
     except Exception as e:
         logger.error(f"Error getting clip notes: {str(e)}")
         return f"Error getting clip notes: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_selected_notes")
+@trajectory_tool("get_selected_notes")
+def get_selected_notes(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Read the MIDI notes currently selected in Live's clip editor (Detail view).
+
+    Returns the clip's name, its Session track/slot when it lives there, and the
+    selected notes (pitch, start_time, duration, velocity, mute), sorted by time.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("get_selected_notes")
+        if missing:
+            return missing
+        result = get_ableton_connection().send_command("get_selected_notes")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting selected notes: {str(e)}")
+        return f"Error getting selected notes: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("duplicate_clip_loop")
+@trajectory_tool("duplicate_clip_loop")
+def duplicate_clip_loop(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    target_clip_index: int = -1,
+    times: int = 2,
+    user_prompt: str = "",
+) -> str:
+    """
+    Copy a Session MIDI clip into an empty slot, repeating its loop `times` times.
+
+    The source clip is left untouched. Use this to extend a loop (e.g. 4 bars ->
+    8 bars) before developing the second half.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Source clip slot index
+    - target_clip_index: Empty slot to write to (-1 = next empty slot below the source)
+    - times: How many times to repeat the loop (1-16, default 2)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("duplicate_clip_loop")
+        if missing:
+            return missing
+        params = {"track_index": track_index, "clip_index": clip_index, "times": times}
+        if target_clip_index is not None and target_clip_index >= 0:
+            params["target_clip_index"] = target_clip_index
+        result = get_ableton_connection().send_command("duplicate_clip_loop", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error duplicating clip loop: {str(e)}")
+        return f"Error duplicating clip loop: {str(e)}"
 
 
 @mcp.tool()

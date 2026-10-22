@@ -17,6 +17,7 @@ socket). No Ableton, no network.
 import importlib.util
 import json
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -70,6 +71,12 @@ def make_instance(script_module, application=None):
     inst.application = lambda: application
     inst.log_message = lambda *a, **k: None
     inst.show_message = lambda *a, **k: None
+    # What __init__ sets up for main-thread dispatch; the test thread plays
+    # the part of Live's main thread.
+    inst._main_thread = threading.current_thread()
+    inst._main_queue = script_module.queue.Queue()
+    inst._passive_enabled = False
+    inst._passive_rebind_pending = False
     return inst
 
 
