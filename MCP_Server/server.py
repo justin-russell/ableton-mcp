@@ -139,7 +139,7 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator", "duplicate_clip_loop"
+            "create_locator", "duplicate_clip_loop", "set_track_routing"
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -582,6 +582,87 @@ def duplicate_clip_loop(
     except Exception as e:
         logger.error(f"Error duplicating clip loop: {str(e)}")
         return f"Error duplicating clip loop: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_track_routing")
+@trajectory_tool("get_track_routing")
+def get_track_routing(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """
+    Show a track's input/output routing and monitoring, with every option Live offers.
+
+    Returns output/input each as {current, options, channel, channel_options} plus
+    monitoring ("In", "Auto", "Off"). Use the option names with set_track_routing.
+
+    Parameters:
+    - track_index: The track to inspect
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("get_track_routing")
+        if missing:
+            return missing
+        result = get_ableton_connection().send_command("get_track_routing", {"track_index": track_index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting track routing: {str(e)}")
+        return f"Error getting track routing: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_track_routing")
+@trajectory_tool("set_track_routing")
+def set_track_routing(
+    ctx: Context,
+    track_index: int,
+    output: str = "",
+    output_channel: str = "",
+    input: str = "",
+    input_channel: str = "",
+    monitoring: str = "",
+    user_prompt: str = "",
+) -> str:
+    """
+    Change a track's routing ("Audio To" / "Audio From" / "MIDI From") and monitoring.
+
+    Values are matched by name against the options get_track_routing lists:
+    exact, then case-insensitive, then a unique partial match. Leave a field
+    empty to keep it unchanged. Returns the track's routing afterwards.
+
+    Examples: output="SC Bus" (send a track into another track),
+    output="Sends Only", input="4-Kick" with input_channel="Post FX",
+    monitoring="In".
+
+    Parameters:
+    - track_index: The track to change
+    - output: Output routing type, e.g. "Master", "Sends Only", or another track's name
+    - output_channel: Output channel, e.g. "Track In" or "Post FX" (optional)
+    - input: Input routing type, e.g. "Ext. In", "No Input", or another track's name
+    - input_channel: Input channel, e.g. "Pre FX", "Post FX", "Post Mixer" (optional)
+    - monitoring: "In", "Auto" or "Off"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_track_routing")
+        if missing:
+            return missing
+        params = {"track_index": track_index}
+        for key, value in (("output", output), ("output_channel", output_channel),
+                           ("input", input), ("input_channel", input_channel),
+                           ("monitoring", monitoring)):
+            if value:
+                params[key] = value
+        if len(params) == 1:
+            return "Nothing to change: pass output, input, their channels, or monitoring."
+        result = get_ableton_connection().send_command("set_track_routing", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting track routing: {str(e)}")
+        return f"Error setting track routing: {str(e)}"
 
 
 @mcp.tool()

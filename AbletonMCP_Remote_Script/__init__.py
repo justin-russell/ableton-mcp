@@ -38,7 +38,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.0"
+SCRIPT_VERSION = "1.9.0"
 PROTOCOL_VERSION = 1
 
 # Per-command limits for how long a client waits on Live's main thread.
@@ -60,6 +60,8 @@ BROWSER_WALK_MAX_SECONDS = 4.0
 SCRIPT_CAPABILITIES = [
     "get_selected_notes",
     "duplicate_clip_loop",
+    "get_track_routing",
+    "set_track_routing",
     "get_session_info",
     "get_track_info",
     "get_script_info",
@@ -547,6 +549,16 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 clip_index = params.get("clip_index", 0)
                 response["result"] = self._get_clip_notes(track_index, clip_index)
+            elif command_type == "get_track_routing":
+                response["result"] = self._get_track_routing(params.get("track_index", 0))
+            elif command_type == "set_track_routing":
+                response["result"] = self._set_track_routing(
+                    params.get("track_index", 0),
+                    output=params.get("output"),
+                    output_channel=params.get("output_channel"),
+                    input=params.get("input"),
+                    input_channel=params.get("input_channel"),
+                    monitoring=params.get("monitoring"))
             elif command_type == "get_selected_notes":
                 response["result"] = self._get_selected_notes()
             elif command_type == "duplicate_clip_loop":
@@ -789,6 +801,110 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting track name: " + str(e))
             raise
     
+    # ── Track routing ──────────────────────────────────────────────────────────
+
+    _MONITORING_NAMES = ("In", "Auto", "Off")  # Track.current_monitoring_state values 0/1/2
+
+    def _routing_track(self, track_index):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        return self._song.tracks[track_index]
+
+    @staticmethod
+    def _routing_name(obj):
+        name = getattr(obj, "display_name", None)
+        return obj if name is None else name
+
+    def _routing_side(self, track, side):
+        """Current value and options for one side ('output' or 'input')."""
+        info = {}
+        types_attr = "available_%s_routing_types" % side
+        if hasattr(track, types_attr):  # Live 10+ RoutingType API
+            info["current"] = self._routing_name(getattr(track, "%s_routing_type" % side))
+            info["options"] = [self._routing_name(t) for t in getattr(track, types_attr)]
+            try:
+                info["channel"] = self._routing_name(getattr(track, "%s_routing_channel" % side))
+                info["channel_options"] = [self._routing_name(c) for c in
+                                           getattr(track, "available_%s_routing_channels" % side)]
+            except Exception:
+                pass
+        elif hasattr(track, "%s_routings" % side):  # legacy string API
+            info["current"] = getattr(track, "current_%s_routing" % side)
+            info["options"] = list(getattr(track, "%s_routings" % side))
+        else:
+            info["current"] = None
+            info["options"] = []
+        return info
+
+    def _get_track_routing(self, track_index):
+        track = self._routing_track(track_index)
+        result = {
+            "track_index": track_index,
+            "name": track.name,
+            "output": self._routing_side(track, "output"),
+            "input": self._routing_side(track, "input"),
+            "monitoring": None,
+        }
+        try:
+            result["monitoring"] = self._MONITORING_NAMES[int(track.current_monitoring_state)]
+        except Exception:
+            pass  # group tracks have no monitoring
+        return result
+
+    @staticmethod
+    def _pick_routing(options, wanted, what):
+        """Match ``wanted`` against option names: exact, then case-insensitive,
+        then a unique substring match."""
+        names = [AbletonMCP._routing_name(o) for o in options]
+        for o, n in zip(options, names):
+            if n == wanted:
+                return o
+        low = wanted.lower()
+        for o, n in zip(options, names):
+            if n.lower() == low:
+                return o
+        partial = [o for o, n in zip(options, names) if low in n.lower()]
+        if len(partial) == 1:
+            return partial[0]
+        raise ValueError("No unique %s matching '%s'. Options: %s"
+                         % (what, wanted, ", ".join(names)))
+
+    def _set_routing_side(self, track, side, value, channel):
+        types_attr = "available_%s_routing_types" % side
+        if hasattr(track, types_attr):
+            if value is not None:
+                chosen = self._pick_routing(list(getattr(track, types_attr)), value, side + " routing")
+                setattr(track, "%s_routing_type" % side, chosen)
+            if channel is not None:
+                chans = list(getattr(track, "available_%s_routing_channels" % side))
+                chosen = self._pick_routing(chans, channel, side + " channel")
+                setattr(track, "%s_routing_channel" % side, chosen)
+        elif hasattr(track, "%s_routings" % side):
+            if value is not None:
+                chosen = self._pick_routing(list(getattr(track, "%s_routings" % side)), value,
+                                            side + " routing")
+                setattr(track, "current_%s_routing" % side, chosen)
+            if channel is not None:
+                chosen = self._pick_routing(list(getattr(track, "%s_sub_routings" % side)), channel,
+                                            side + " channel")
+                setattr(track, "current_%s_sub_routing" % side, chosen)
+        else:
+            raise Exception("This Live version exposes no %s routing API" % side)
+
+    def _set_track_routing(self, track_index, output=None, output_channel=None,
+                           input=None, input_channel=None, monitoring=None):
+        track = self._routing_track(track_index)
+        if output is not None or output_channel is not None:
+            self._set_routing_side(track, "output", output, output_channel)
+        if input is not None or input_channel is not None:
+            self._set_routing_side(track, "input", input, input_channel)
+        if monitoring is not None:
+            names = [n.lower() for n in self._MONITORING_NAMES]
+            if str(monitoring).lower() not in names:
+                raise ValueError("monitoring must be one of: In, Auto, Off")
+            track.current_monitoring_state = names.index(str(monitoring).lower())
+        return self._get_track_routing(track_index)
+
     def _create_clip(self, track_index, clip_index, length):
         """Create a new MIDI clip in the specified track and clip slot"""
         try:
